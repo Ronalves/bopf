@@ -1,0 +1,574 @@
+FUNCTION yotm_create_bp_from_portaria.
+*"----------------------------------------------------------------------
+*"*"Local Interface:
+*"  TABLES
+*"      IT_INFOS STRUCTURE  YOTM_CTRL_PORTARIA
+*"      IT_PLACAS STRUCTURE  YOYL_CTRL_PORTARIA_PLACAS
+*"      IT_RETURN STRUCTURE  BAPIRET2
+*"----------------------------------------------------------------------
+
+* Types
+  TYPES : BEGIN OF ty_resources,
+            mtr TYPE /sapapo/mtrcomb-mtrcomb,
+          END OF ty_resources.
+
+* Variaveis
+  DATA : lv_rejected  TYPE wdy_boolean,
+         lv_cpf_valid TYPE n LENGTH 11,
+         lv_peso      TYPE /scmtms/qua_gro_wei_val,
+         lv_peso_tot  TYPE /scmtms/qua_gro_wei_val,
+         lv_qtd_split TYPE /scmtms/quantity,
+         lv_system    TYPE tbdls-logsys.
+
+* Objetos
+  DATA : lo_message    TYPE REF TO /bobf/if_frw_message,
+         lo_item_dri   TYPE REF TO /scmtms/s_tor_item_tr_k,
+         lo_item_param TYPE REF TO /scmtms/s_tor_a_add_local_itm,
+         lo_tm_control TYPE REF TO yocltm_global_codes.
+
+* Tabelas internas
+  DATA : lt_torrot        TYPE /scmtms/t_tor_root_k,
+         lt_freight_units TYPE /scmtms/t_tor_root_k,
+         lt_item          TYPE /scmtms/t_tor_item_tr_k,
+         lt_modification  TYPE /bobf/t_frw_modification,
+         lt_resources     TYPE TABLE OF ty_resources,
+         lt_return_avr    TYPE TABLE OF bapiret2,
+         lt_telefone      TYPE TABLE OF bapiadtel,
+         lt_selres        TYPE TABLE OF bapiresrange,
+         lt_resdim        TYPE TABLE OF bapiscmb0006resdimdatao.
+
+* Constants
+  CONSTANTS: lc_itemid10 TYPE c LENGTH 10 VALUE '0001000010'.
+
+* Workareas
+  DATA : ls_resources         TYPE ty_resources,
+         ls_item_dri          TYPE /scmtms/d_torite,
+         ls_central_data_bp   TYPE bapibus1006_central,
+         ls_central_dt_person TYPE bapibus1006_central_person,
+         ls_central_org       TYPE bapibus1006_central_organ,
+         ls_central_grp       TYPE bapibus1006_central_group,
+         ls_central_vldt      TYPE bapibus1006_central_validity,
+         ls_selres            TYPE bapiresrange.
+
+  IF it_placas IS INITIAL.
+    APPEND VALUE bapiret2( type = 'E' message = TEXT-002 ) TO it_return.
+    RETURN.
+  ENDIF.
+
+  DATA(lo_tormgr) = /bobf/cl_tra_serv_mgr_factory=>get_service_manager( /scmtms/if_tor_c=>sc_bo_key ).
+  DATA(lo_tra) = /bobf/cl_tra_trans_mgr_factory=>get_transaction_manager( ).
+
+  READ TABLE it_infos INTO DATA(ls_infos) INDEX 1.
+
+* Seleciona combinação do meio de transporte
+  LOOP AT it_placas INTO DATA(ls_placas).
+    MOVE ls_placas-resource TO ls_resources-mtr.
+
+    APPEND ls_resources TO lt_resources.
+    CLEAR ls_resources.
+  ENDLOOP.
+
+  IF lt_resources IS NOT INITIAL.
+    SELECT *
+      FROM /sapapo/mtrcomb
+      INTO TABLE @DATA(lt_mtrcomb)
+      FOR ALL ENTRIES IN @lt_resources
+    WHERE mtrcomb = @lt_resources-mtr.
+
+* Seleciona Recursos conjulgados - Dependente do Recurso selecionado na Portaria
+    SELECT *
+      FROM ys4tm_tveicplaca
+      INTO TABLE @DATA(lt_rec)
+      FOR ALL ENTRIES IN @lt_resources
+    WHERE tipo_recurso = @lt_resources-mtr.
+
+    IF sy-subrc IS NOT INITIAL.
+      APPEND VALUE bapiret2( type = 'E' message = TEXT-007 ) TO it_return.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+* Atualizar Ordem de frete com informações do Motorista
+  lo_tormgr->query(
+    EXPORTING
+      iv_query_key            = /scmtms/if_tor_c=>sc_query-root-planning_attributes
+      it_selection_parameters = VALUE #( ( attribute_name = /scmtms/if_tor_c=>sc_query_attribute-root-planning_attributes-tor_id
+                                           sign           = /bobf/if_conf_c=>sc_sign_option_including
+                                           option         = /bobf/if_conf_c=>sc_sign_equal
+                                           low            = ls_infos-tor_id ) )
+      iv_fill_data            = abap_true
+    IMPORTING
+      et_key                  = DATA(it_torkey)
+      et_data                 = lt_torrot ).
+
+  lo_tormgr->retrieve_by_association(
+    EXPORTING
+       iv_node_key    = /scmtms/if_tor_c=>sc_node-root
+       iv_association = /scmtms/if_tor_c=>sc_association-root-item_tr
+       it_key         = it_torkey
+       iv_fill_data   = abap_true
+    IMPORTING
+      et_data         = lt_item ).
+
+  lo_tormgr->retrieve_by_association(
+    EXPORTING
+       iv_node_key    = /scmtms/if_tor_c=>sc_node-root
+       iv_association = /scmtms/if_tor_c=>sc_association-root-assigned_fus
+       it_key         = it_torkey
+       iv_fill_data   = abap_true
+    IMPORTING
+      et_data         = lt_freight_units ).
+
+* Verifica se o CPF do Motorista já esta cadastrado
+  SELECT SINGLE *
+    FROM dfkkbptaxnum
+    INTO @DATA(ls_taxnum)
+  WHERE taxnum = @ls_infos-cpf.
+
+  IF sy-subrc IS NOT INITIAL.
+    DATA(ls_central_data) = VALUE bapibus1006_central( title_key = '0005' ).
+
+    DATA(ls_central_data_person) = VALUE bapibus1006_central_person( firstname = ls_infos-driver_name ).
+
+    DATA(lo_create_bp) = NEW yocltm_cnhportal( ).
+
+* Realiza criação do BP
+    CALL METHOD lo_create_bp->cria_bp
+      EXPORTING
+        p_centraldata  = ls_central_data
+        p_centraldatap = ls_central_data_person
+        motorista      = ls_infos-driver_name
+        telefone       = ls_infos-mobile
+        pais           = 'BR'
+      RECEIVING
+        return         = DATA(lv_new_bp).
+
+* Realiza inserção da Role de Motorista para o novo BP
+    IF lv_new_bp IS NOT INITIAL.
+      COMMIT WORK AND WAIT.
+
+* Buscar codigo do BP
+      SELECT SINGLE *
+        FROM but000
+        INTO @DATA(ls_but000)
+      WHERE partner = @lv_new_bp.
+
+      CALL FUNCTION 'BAPI_BUPA_ROLE_ADD'
+        EXPORTING
+          businesspartner     = lv_new_bp
+          businesspartnerrole = 'TM0001'
+        TABLES
+          return              = it_return.
+
+      CALL FUNCTION 'BAPI_BUPA_ROLE_ADD'
+        EXPORTING
+          businesspartner     = lv_new_bp
+          businesspartnerrole = 'CRM010'
+        TABLES
+          return              = it_return.
+
+      READ TABLE it_return INTO DATA(ls_return) WITH KEY type = 'E'.
+
+      IF ls_return-type IS INITIAL.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = abap_true.
+      ENDIF.
+    ENDIF.
+
+* Insere CPF no cadatro do BP
+    IF ls_infos-cpf IS NOT INITIAL .
+      CALL FUNCTION 'CONVERSION_EXIT_CPFBR_INPUT'
+        EXPORTING
+          input     = ls_infos-cpf
+        IMPORTING
+          output    = lv_cpf_valid
+        EXCEPTIONS
+          not_valid = 1
+          OTHERS    = 2.
+
+      IF lv_cpf_valid IS INITIAL.
+        APPEND VALUE bapiret2( type = 'E' message = TEXT-004 ) TO it_return.
+        RETURN.
+      ENDIF.
+
+      IF ls_infos-cpf IS NOT INITIAL.
+        MOVE : lv_new_bp     TO ls_taxnum-partner,
+               'BR2'         TO ls_taxnum-taxtype,
+               ls_infos-cpf  TO ls_taxnum-taxnum.
+
+        MODIFY dfkkbptaxnum FROM ls_taxnum.
+      ENDIF.
+    ENDIF.
+
+    READ TABLE lt_item REFERENCE INTO DATA(lo_item) WITH KEY item_cat = /scmtms/if_tor_const=>sc_tor_item_category-driver.
+
+    IF sy-subrc IS INITIAL.
+* Atualizar BP existente na OF
+      lo_item->res_id     = lv_new_bp.
+      lo_item->res_key    = ls_but000-partner_guid.
+      lo_item->item_descr = ls_infos-driver_name.
+
+      APPEND INITIAL LINE TO lt_modification ASSIGNING FIELD-SYMBOL(<ls_modification>).
+      <ls_modification>-node        = /scmtms/if_tor_c=>sc_node-item_tr.
+      <ls_modification>-change_mode = /bobf/if_frw_c=>sc_modify_update.
+      <ls_modification>-key         = lo_item->key.
+      <ls_modification>-data        = lo_item.
+      <ls_modification>-changed_fields = VALUE #( ( /scmtms/if_tor_c=>sc_node_attribute-item_tr-res_id )
+                                                  ( /scmtms/if_tor_c=>sc_node_attribute-item_tr-res_key )
+                                                  ( /scmtms/if_tor_c=>sc_node_attribute-item_tr-item_descr ) ).
+
+      lo_tormgr->modify(
+        EXPORTING
+          it_modification = lt_modification ).
+
+      lo_tra->save(
+          IMPORTING
+            ev_rejected = lv_rejected ).
+    ELSE.
+* Inserir novo BP na Ordem de frete
+      CLEAR lt_modification.
+
+      READ TABLE it_placas INTO ls_placas INDEX 1.
+      READ TABLE lt_item REFERENCE INTO lo_item INDEX 1.
+      READ TABLE lt_item REFERENCE INTO DATA(lo_parent_item) INDEX 2.
+
+      ls_item_dri-db_key             = /bobf/cl_frw_factory=>get_new_key( ).
+      ls_item_dri-parent_key         = lo_item->parent_key.
+      ls_item_dri-item_id            = lc_itemid10.
+      ls_item_dri-item_cat           = /scmtms/if_tor_const=>sc_tor_item_category-driver.
+      ls_item_dri-item_descr         = ls_but000-mc_name2.
+      ls_item_dri-res_id             = ls_placas-resource.
+      ls_item_dri-item_descr         = ls_infos-driver_name.
+      ls_item_dri-item_parent_key    = lo_parent_item->item_parent_key.
+      ls_item_dri-src_stop_key       = lo_item->src_stop_key.
+      ls_item_dri-des_stop_key       = lo_item->des_stop_key.
+      ls_item_dri-item_sort_id       = lo_item->item_sort_id.
+      ls_item_dri-orig_ref_item      = lo_item->orig_ref_item.
+      ls_item_dri-orig_ref_root      = lo_item->orig_ref_root.
+      ls_item_dri-orig_ref_bo        = /scmtms/if_common_c=>c_bo_short_name-tor.
+      ls_item_dri-fu_root_key        = lo_item->fu_root_key.
+      ls_item_dri-res_id             = lv_new_bp.
+      ls_item_dri-res_key            = ls_but000-partner_guid.
+      ls_item_dri-res_time_check_rel = 'R'.
+      ls_item_dri-item_descr         = ls_infos-driver_name.
+      ls_item_dri-res_key            = ls_but000-partner_guid.
+      ls_item_dri-res_id             = lv_new_bp.
+      ls_item_dri-res_seq            = 1.
+
+      MODIFY /scmtms/d_torite FROM ls_item_dri.
+      COMMIT WORK.
+    ENDIF.
+  ELSE.
+* Verificar se existe alguma diverencia no cadastro do motorista
+    CALL FUNCTION 'BAPI_BUPA_CENTRAL_GETDETAIL'
+      EXPORTING
+        businesspartner         = ls_taxnum-partner
+      IMPORTING
+        centraldata             = ls_central_data_bp
+        centraldataperson       = ls_central_dt_person
+        centraldataorganization = ls_central_org
+        centraldatagroup        = ls_central_grp
+        centraldatavalidity     = ls_central_vldt
+      TABLES
+        telefondatanonaddress   = lt_telefone.
+
+* Validação de dados inseridos em tela
+    ls_infos = it_infos[ 1 ].
+
+    IF line_exists( it_infos[ driver_name = ls_central_dt_person-firstname ] ).
+      IF line_exists( lt_telefone[ telephone = ls_infos-mobile ] ).
+
+      ELSE.
+        APPEND VALUE bapiret2( type = 'W' message = TEXT-006 ) TO it_return.
+      ENDIF.
+    ELSE.
+      APPEND VALUE bapiret2( type = 'W' message = TEXT-005 ) TO it_return.
+    ENDIF.
+
+    READ TABLE lt_item REFERENCE INTO lo_item WITH KEY item_cat = /scmtms/if_tor_const=>sc_tor_item_category-driver.
+
+    IF sy-subrc IS INITIAL.
+* Buscar codigo do BP
+      SELECT SINGLE *
+        FROM but000
+        INTO ls_but000
+      WHERE partner = ls_taxnum-partner.
+
+* Atualizar BP existente na OF
+      lo_item->res_id     = ls_taxnum-partner.
+      lo_item->res_key    = ls_but000-partner_guid.
+      lo_item->item_descr = ls_infos-driver_name.
+
+      APPEND INITIAL LINE TO lt_modification ASSIGNING <ls_modification>.
+      <ls_modification>-node        = /scmtms/if_tor_c=>sc_node-item_tr.
+      <ls_modification>-change_mode = /bobf/if_frw_c=>sc_modify_update.
+      <ls_modification>-key         = lo_item->key.
+      <ls_modification>-data        = lo_item.
+      <ls_modification>-changed_fields = VALUE #( ( /scmtms/if_tor_c=>sc_node_attribute-item_tr-res_id )
+                                                  ( /scmtms/if_tor_c=>sc_node_attribute-item_tr-res_key )
+                                                  ( /scmtms/if_tor_c=>sc_node_attribute-item_tr-item_descr ) ).
+
+      lo_tormgr->modify(
+        EXPORTING
+          it_modification = lt_modification ).
+
+      lo_tra->save(
+          IMPORTING
+            ev_rejected = lv_rejected ).
+    ELSE.
+* Inserir novo BP na Ordem de frete
+      CLEAR lt_modification.
+
+      READ TABLE it_placas INTO ls_placas INDEX 1.
+      READ TABLE lt_item REFERENCE INTO lo_item INDEX 1.
+      READ TABLE lt_item REFERENCE INTO lo_parent_item INDEX 2.
+
+      ls_item_dri-db_key             = /bobf/cl_frw_factory=>get_new_key( ).
+      ls_item_dri-parent_key         = lo_item->parent_key.
+      ls_item_dri-item_id            = lc_itemid10.
+      ls_item_dri-item_cat           = /scmtms/if_tor_const=>sc_tor_item_category-driver.
+      ls_item_dri-item_descr         = ls_but000-mc_name2.
+      ls_item_dri-res_id             = ls_placas-resource.
+      ls_item_dri-item_descr         = ls_infos-driver_name.
+      ls_item_dri-item_parent_key    = lo_parent_item->item_parent_key.
+      ls_item_dri-src_stop_key       = lo_item->src_stop_key.
+      ls_item_dri-des_stop_key       = lo_item->des_stop_key.
+      ls_item_dri-item_sort_id       = lo_item->item_sort_id.
+      ls_item_dri-orig_ref_item      = lo_item->orig_ref_item.
+      ls_item_dri-orig_ref_root      = lo_item->orig_ref_root.
+      ls_item_dri-orig_ref_bo        = /scmtms/if_common_c=>c_bo_short_name-tor.
+      ls_item_dri-fu_root_key        = lo_item->fu_root_key.
+      ls_item_dri-res_id             = lv_new_bp.
+      ls_item_dri-res_key            = ls_but000-partner_guid.
+      ls_item_dri-res_time_check_rel = 'R'.
+      ls_item_dri-item_descr         = ls_infos-driver_name.
+      ls_item_dri-res_key            = ls_but000-partner_guid.
+      ls_item_dri-res_id             = lv_new_bp.
+      ls_item_dri-res_seq            = 1.
+
+      MODIFY /scmtms/d_torite FROM ls_item_dri.
+      COMMIT WORK.
+    ENDIF.
+  ENDIF.
+
+  lo_tm_control = NEW #( ).
+
+* Desplaneja a Unidade de frete para Split
+  lo_tm_control->unplan_fu(
+    EXPORTING
+      imp_key_fo = CORRESPONDING #( lt_torrot MAPPING key = key )
+      imp_key_fu = CORRESPONDING #( lt_freight_units MAPPING key = key )
+    IMPORTING
+      et_return  = DATA(lt_return) ).
+
+  IF lt_return IS NOT INITIAL.
+    IF line_exists( it_return[ type = 'E' ] ).
+      APPEND lt_return TO it_return.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+* Realiza Split da Unidade de frete
+  CLEAR lv_qtd_split.
+
+  LOOP AT lt_rec INTO DATA(ls_rec).
+* Primeiro Compartimento
+    IF ls_rec-meio_transp1 IS NOT INITIAL.
+      ADD 1 TO lv_qtd_split.
+
+      ls_selres-sign   = /bobf/if_conf_c=>sc_sign_option_including.
+      ls_selres-option = /bobf/if_conf_c=>sc_sign_equal.
+      ls_selres-low    = ls_rec-meio_transp1.
+      APPEND ls_selres TO lt_selres.
+      CLEAR ls_selres.
+    ENDIF.
+
+* Segundo Compartimento
+    IF ls_rec-meio_transp2 IS NOT INITIAL.
+      ADD 1 TO lv_qtd_split.
+
+      ls_selres-sign   = /bobf/if_conf_c=>sc_sign_option_including.
+      ls_selres-option = /bobf/if_conf_c=>sc_sign_equal.
+      ls_selres-low    = ls_rec-meio_transp2.
+      APPEND ls_selres TO lt_selres.
+      CLEAR ls_selres.
+    ENDIF.
+
+* Terceiro Compartimento
+    IF ls_rec-meio_transp3 IS NOT INITIAL.
+      ADD 1 TO lv_qtd_split.
+
+      ls_selres-sign   = /bobf/if_conf_c=>sc_sign_option_including.
+      ls_selres-option = /bobf/if_conf_c=>sc_sign_equal.
+      ls_selres-low    = ls_rec-meio_transp3.
+      APPEND ls_selres TO lt_selres.
+      CLEAR ls_selres.
+    ENDIF.
+  ENDLOOP.
+
+* Verificar quantidade do Peso das Unidades de frete
+  IF line_exists( lt_freight_units[ 1 ] ).
+    lv_peso_tot = lt_freight_units[ 1 ]-gro_wei_val.
+  ENDIF.
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system = lv_system.
+
+  CALL FUNCTION 'BAPI_RSSRVSCMB_GETLIST'
+    EXPORTING
+      logical_system     = lv_system
+    TABLES
+      resource_selection = lt_selres
+      resource_dim       = lt_resdim.
+
+* Buscar capacidade do Recurso
+  IF line_exists( lt_resdim[ dimension = 'MASS' ] ).
+    DATA(lv_cap_rec) = lt_resdim[ dimension = 'MASS' ]-noindivres.
+  ELSE.
+    APPEND VALUE bapiret2( type = 'E' message = TEXT-008 ) TO it_return.
+    RETURN.
+  ENDIF.
+
+* Preenche Peso que será inserido nas Unidades de frete Splitadas baseadas no peso dos recursos.
+  IF lv_cap_rec IS NOT INITIAL.
+    lv_peso = ( lv_cap_rec / lv_qtd_split ).
+  ENDIF.
+
+  lo_tm_control->split_fu(
+    EXPORTING
+      imp_uni_frete = CORRESPONDING #( lt_freight_units MAPPING key = key )
+      imp_qtd_peso  = lv_peso
+      imp_qtd_split = lv_qtd_split
+    IMPORTING
+      et_return     = lt_return
+      exp_status    = DATA(lv_status) ).
+
+  IF lt_return IS NOT INITIAL.
+    IF line_exists( it_return[ type = 'E' ] ).
+      APPEND lt_return TO it_return.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+* Faz o Replanejamento da FU e as demais criadas com o SPLIT
+  lo_tm_control->cria_tu_from_fu(
+    EXPORTING
+      imp_qtd_tu = lv_qtd_split
+    IMPORTING
+      et_root    = DATA(lt_new_tu)
+      et_return  = lt_return ).
+
+  IF lt_return IS NOT INITIAL.
+    IF line_exists( it_return[ type = 'E' ] ).
+      APPEND lt_return TO it_return.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+* Realiza o envio da Ordem de frete para o Yard Logistics
+  lo_tm_control->send_of_yl(
+    EXPORTING
+      imp_key_of = CORRESPONDING #( lt_torrot MAPPING key = key )
+    IMPORTING
+      et_return  = lt_return ).
+
+  IF lt_return IS NOT INITIAL.
+    IF line_exists( it_return[ type = 'E' ] ).
+      APPEND lt_return TO it_return.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+* Inserção das novas linhas de compartimentos na TORITE
+  LOOP AT it_placas INTO ls_placas.
+    IF ls_placas-placa_trk IS NOT INITIAL.
+      READ TABLE lt_item REFERENCE INTO lo_item WITH KEY item_cat = /scmtms/if_tor_const=>sc_tor_item_category-av_item.
+
+      IF sy-subrc IS INITIAL.
+        lo_item->platenumber = it_placas[ 1 ]-placa_trk .
+        lo_item->country     = 'BR'.
+
+        APPEND INITIAL LINE TO lt_modification ASSIGNING <ls_modification>.
+        <ls_modification>-node           = /scmtms/if_tor_c=>sc_node-item_tr.
+        <ls_modification>-change_mode    = /bobf/if_frw_c=>sc_modify_update.
+        <ls_modification>-key            = lo_item->key.
+        <ls_modification>-data           = lo_item.
+        <ls_modification>-changed_fields = VALUE #( ( /scmtms/if_tor_c=>sc_node_attribute-item_tr-platenumber )
+                                                    ( /scmtms/if_tor_c=>sc_node_attribute-item_tr-country ) ).
+
+        lo_tormgr->modify(
+          EXPORTING
+            it_modification = lt_modification
+          IMPORTING
+            eo_message      = lo_message ).
+
+        DATA(lv_check) = abap_true.
+      ENDIF.
+    ENDIF.
+
+    IF ls_placas-placa_trailler1 IS NOT INITIAL.
+      lo_item_param = NEW #( ).
+
+* Criação da nova linha de ITEM Trailer considerando o meio de transporte conjulgado
+      lo_item_param->item_cat  = /scmtms/if_tor_const=>sc_tor_item_category-pv_item.
+      lo_item_param->item_type = 'TRL'.
+
+      READ TABLE lt_item REFERENCE INTO lo_item WITH KEY item_cat = /scmtms/if_tor_const=>sc_tor_item_category-av_item.
+
+      lo_tormgr->do_action(
+        EXPORTING
+          it_key        = VALUE #( ( key = lo_item->key ) )
+          iv_act_key    = /scmtms/if_tor_c=>sc_action-item_tr-add_pvr
+          is_parameters = lo_item_param
+        IMPORTING
+          eo_message    = lo_message ).
+
+      /scmtms/cl_common_helper=>msg_convert_bopf_2_bapiret2(
+        EXPORTING
+          io_message  = lo_message
+        CHANGING
+          ct_bapiret2 = lt_return_avr ).
+    ENDIF.
+
+    IF ls_placas-placa_trailler2 IS NOT INITIAL.
+      IF lo_item_param IS NOT BOUND.
+        lo_item_param = NEW #( ).
+      ENDIF.
+
+* Criação da nova linha de ITEM Trailer considerando o meio de transporte conjulgado
+      lo_item_param->item_cat  = /scmtms/if_tor_const=>sc_tor_item_category-pv_item.
+      lo_item_param->item_type = 'TRL'.
+
+      lo_tormgr->do_action(
+        EXPORTING
+          it_key        = CORRESPONDING #( it_torkey MAPPING key = key )
+          iv_act_key    = /scmtms/if_tor_c=>sc_action-item_tr-add_pvr
+          is_parameters = lo_item_param
+        IMPORTING
+          eo_message    = lo_message ).
+
+      /scmtms/cl_common_helper=>msg_convert_bopf_2_bapiret2(
+        EXPORTING
+          io_message  = lo_message
+        CHANGING
+          ct_bapiret2 = lt_return_avr ).
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_check IS NOT INITIAL.
+* Criação da Remessa através do TM
+    lo_tormgr->do_action(
+      EXPORTING
+        it_key        = CORRESPONDING #( it_torkey MAPPING key = key )
+        iv_act_key    = /scmtms/if_tor_c=>sc_action-root-create_and_send_dlvp
+      IMPORTING
+        eo_message    = lo_message ).
+
+    lo_tra->save(
+        IMPORTING
+          ev_rejected = lv_rejected ).
+  ENDIF.
+
+ENDFUNCTION.
